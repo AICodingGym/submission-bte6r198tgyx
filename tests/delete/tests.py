@@ -1,13 +1,16 @@
 from math import ceil
+from unittest import skipUnless
 
 from django.db import IntegrityError, connection, models
 from django.db.models.deletion import Collector
 from django.db.models.sql.constants import GET_ITERATOR_CHUNK_SIZE
 from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
+from django.test.utils import CaptureQueriesContext
 
 from .models import (
     MR, A, Avatar, Base, Child, HiddenUser, HiddenUserProfile, M, M2MFrom,
-    M2MTo, MRNull, Parent, R, RChild, S, T, User, create_a, get_default_r,
+    M2MTo, MRNull, Origin, Parent, R, RChild, Referrer, S, T, User, create_a,
+    get_default_r,
 )
 
 
@@ -436,6 +439,66 @@ class DeletionTests(TestCase):
         # One query for the Avatar table and a second for the User one.
         with self.assertNumQueries(2):
             avatar.delete()
+
+    def test_only_referenced_fields_selected(self):
+        """
+        The cascade SELECT for related objects fetches only the fields that
+        other relations point to (here the pk and unique_field), not
+        unrelated columns such as large_field.
+        """
+        origin = Origin.objects.create()
+        Referrer.objects.create(origin=origin, unique_field=1, large_field='x')
+        with CaptureQueriesContext(connection) as ctx:
+            origin.delete()
+        select_sql = ctx.captured_queries[0]['sql']
+        self.assertIn(connection.ops.quote_name(Referrer._meta.db_table), select_sql)
+        self.assertIn(connection.ops.quote_name('id'), select_sql)
+        self.assertIn(connection.ops.quote_name('unique_field'), select_sql)
+        self.assertNotIn(connection.ops.quote_name('large_field'), select_sql)
+        self.assertFalse(Referrer.objects.exists())
+
+    def test_all_fields_selected_when_deletion_signals_connected(self):
+        """
+        Signal receivers get full instances, so no field is deferred when a
+        pre_delete or post_delete receiver is connected for the model.
+        """
+        def receiver(instance, **kwargs):
+            pass
+
+        for signal_name in ('pre_delete', 'post_delete'):
+            with self.subTest(signal=signal_name):
+                signal = getattr(models.signals, signal_name)
+                origin = Origin.objects.create()
+                signal.connect(receiver, sender=Referrer)
+                try:
+                    with CaptureQueriesContext(connection) as ctx:
+                        origin.delete()
+                finally:
+                    signal.disconnect(receiver, sender=Referrer)
+                self.assertIn(
+                    connection.ops.quote_name('large_field'),
+                    ctx.captured_queries[0]['sql'],
+                )
+
+    @skipUnless(connection.vendor == 'sqlite', 'SQLite raises on invalid UTF-8.')
+    def test_delete_skips_undecodable_unreferenced_field(self):
+        """
+        Regression for #30191: a column holding bytes that aren't valid
+        UTF-8 doesn't break cascade deletion when nothing references it.
+        """
+        origin = Origin.objects.create()
+        referrer = Referrer.objects.create(
+            origin=origin, unique_field=1, large_field='ok',
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE %s SET large_field = CAST(X'61ED6262' AS TEXT) "
+                "WHERE id = %%s" % Referrer._meta.db_table,
+                [referrer.pk],
+            )
+        origin.delete()
+        self.assertFalse(Referrer.objects.exists())
+        self.assertFalse(Origin.objects.exists())
 
 
 class FastDeleteTests(TestCase):
